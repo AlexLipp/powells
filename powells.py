@@ -76,6 +76,280 @@ def _line_for_search(x0, alpha, lower_bound, upper_bound):
     return (lmin, lmax) if lmax >= lmin else (0, 0)
 
 
+def brent(func, args=(), brack=None, tol=1.48e-8, full_output=0, maxiter=500):
+    """
+    Given a function of one variable and a possible bracket, return
+    the local minimum of the function isolated to a fractional precision
+    of tol.
+
+    Parameters
+    ----------
+    func : callable f(x,*args)
+        Objective function.
+    args : tuple, optional
+        Additional arguments (if present).
+    brack : tuple, optional
+        Either a triple (xa,xb,xc) where xa<xb<xc and func(xb) <
+        func(xa), func(xc) or a pair (xa,xb) which are used as a
+        starting interval for a downhill bracket search (see
+        `bracket`). Providing the pair (xa,xb) does not always mean
+        the obtained solution will satisfy xa<=x<=xb.
+    tol : float, optional
+        Stop if between iteration change is less than `tol`.
+    full_output : bool, optional
+        If True, return all output args (xmin, fval, iter,
+        funcalls).
+    maxiter : int, optional
+        Maximum number of iterations in solution.
+
+    Returns
+    -------
+    xmin : ndarray
+        Optimum point.
+    fval : float
+        Optimum value.
+    iter : int
+        Number of iterations.
+    funcalls : int
+        Number of objective function evaluations made.
+
+    See also
+    --------
+    minimize_scalar: Interface to minimization algorithms for scalar
+        univariate functions. See the 'Brent' `method` in particular.
+
+    Notes
+    -----
+    Uses inverse parabolic interpolation when possible to speed up
+    convergence of golden section method.
+
+    Does not ensure that the minimum lies in the range specified by
+    `brack`. See `fminbound`.
+
+    Examples
+    --------
+    We illustrate the behaviour of the function when `brack` is of
+    size 2 and 3 respectively. In the case where `brack` is of the
+    form (xa,xb), we can see for the given values, the output need
+    not necessarily lie in the range (xa,xb).
+
+    >>> def f(x):
+    ...     return x**2
+
+    >>> from scipy import optimize
+
+    >>> minimum = optimize.brent(f,brack=(1,2))
+    >>> minimum
+    0.0
+    >>> minimum = optimize.brent(f,brack=(-1,0.5,2))
+    >>> minimum
+    -2.7755575615628914e-17
+
+    """
+    options = {'xtol': tol,
+               'maxiter': maxiter}
+    res = _minimize_scalar_brent(func, brack, args, **options)
+    if full_output:
+        return res['x'], res['fun'], res['nit'], res['nfev']
+    else:
+        return res['x']
+
+class Brent:
+    #need to rethink design of __init__
+    def __init__(self, func, args=(), tol=1.48e-8, maxiter=500,
+                 full_output=0):
+        self.func = func
+        self.args = args
+        self.tol = tol
+        self.maxiter = maxiter
+        self._mintol = 1.0e-11
+        self._cg = 0.3819660
+        self.xmin = None
+        self.fval = None
+        self.iter = 0
+        self.funcalls = 0
+
+    # need to rethink design of set_bracket (new options, etc.)
+    def set_bracket(self, brack=None):
+        self.brack = brack
+
+    def get_bracket_info(self):
+        #set up
+        func = self.func
+        args = self.args
+        brack = self.brack
+        ### BEGIN core bracket_info code ###
+        ### carefully DOCUMENT any CHANGES in core ##
+        if brack is None:
+            xa, xb, xc, fa, fb, fc, funcalls = bracket(func, args=args)
+        elif len(brack) == 2:
+            xa, xb, xc, fa, fb, fc, funcalls = bracket(func, xa=brack[0],
+                                                       xb=brack[1], args=args)
+        elif len(brack) == 3:
+            xa, xb, xc = brack
+            if (xa > xc):  # swap so xa < xc can be assumed
+                xc, xa = xa, xc
+            if not ((xa < xb) and (xb < xc)):
+                raise ValueError("Not a bracketing interval.")
+            fa = func(*((xa,) + args))
+            fb = func(*((xb,) + args))
+            fc = func(*((xc,) + args))
+            if not ((fb < fa) and (fb < fc)):
+                raise ValueError("Not a bracketing interval.")
+            funcalls = 3
+        else:
+            raise ValueError("Bracketing interval must be "
+                             "length 2 or 3 sequence.")
+        ### END core bracket_info code ###
+
+        return xa, xb, xc, fa, fb, fc, funcalls
+
+    def optimize(self):
+        # set up for optimization
+        func = self.func
+        xa, xb, xc, fa, fb, fc, funcalls = self.get_bracket_info()
+        _mintol = self._mintol
+        _cg = self._cg
+        #################################
+        #BEGIN CORE ALGORITHM
+        #################################
+        x = w = v = xb
+        fw = fv = fx = func(*((x,) + self.args))
+        if (xa < xc):
+            a = xa
+            b = xc
+        else:
+            a = xc
+            b = xa
+        deltax = 0.0
+        funcalls += 1
+        iter = 0
+        while (iter < self.maxiter):
+            tol1 = self.tol * np.abs(x) + _mintol
+            tol2 = 2.0 * tol1
+            xmid = 0.5 * (a + b)
+            # check for convergence
+            if np.abs(x - xmid) < (tol2 - 0.5 * (b - a)):
+                break
+            # XXX In the first iteration, rat is only bound in the true case
+            # of this conditional. This used to cause an UnboundLocalError
+            # (gh-4140). It should be set before the if (but to what?).
+            if (np.abs(deltax) <= tol1):
+                if (x >= xmid):
+                    deltax = a - x       # do a golden section step
+                else:
+                    deltax = b - x
+                rat = _cg * deltax
+            else:                              # do a parabolic step
+                tmp1 = (x - w) * (fx - fv)
+                tmp2 = (x - v) * (fx - fw)
+                p = (x - v) * tmp2 - (x - w) * tmp1
+                tmp2 = 2.0 * (tmp2 - tmp1)
+                if (tmp2 > 0.0):
+                    p = -p
+                tmp2 = np.abs(tmp2)
+                dx_temp = deltax
+                deltax = rat
+                # check parabolic fit
+                if ((p > tmp2 * (a - x)) and (p < tmp2 * (b - x)) and
+                        (np.abs(p) < np.abs(0.5 * tmp2 * dx_temp))):
+                    rat = p * 1.0 / tmp2        # if parabolic step is useful.
+                    u = x + rat
+                    if ((u - a) < tol2 or (b - u) < tol2):
+                        if xmid - x >= 0:
+                            rat = tol1
+                        else:
+                            rat = -tol1
+                else:
+                    if (x >= xmid):
+                        deltax = a - x  # if it's not do a golden section step
+                    else:
+                        deltax = b - x
+                    rat = _cg * deltax
+
+            if (np.abs(rat) < tol1):            # update by at least tol1
+                if rat >= 0:
+                    u = x + tol1
+                else:
+                    u = x - tol1
+            else:
+                u = x + rat
+            fu = func(*((u,) + self.args))      # calculate new output value
+            funcalls += 1
+
+            if (fu > fx):                 # if it's bigger than current
+                if (u < x):
+                    a = u
+                else:
+                    b = u
+                if (fu <= fw) or (w == x):
+                    v = w
+                    w = u
+                    fv = fw
+                    fw = fu
+                elif (fu <= fv) or (v == x) or (v == w):
+                    v = u
+                    fv = fu
+            else:
+                if (u >= x):
+                    a = x
+                else:
+                    b = x
+                v = w
+                w = x
+                x = u
+                fv = fw
+                fw = fx
+                fx = fu
+
+            iter += 1
+        #################################
+        #END CORE ALGORITHM
+        #################################
+
+        self.xmin = x
+        self.fval = fx
+        self.iter = iter
+        self.funcalls = funcalls
+
+    def get_result(self, full_output=False):
+        if full_output:
+            return self.xmin, self.fval, self.iter, self.funcalls
+        else:
+            return self.xmin    
+    
+def _minimize_scalar_brent(func, brack=None, args=(),
+                           xtol=1.48e-8, maxiter=500,
+                           **unknown_options):
+    """
+    Options
+    -------
+    maxiter : int
+        Maximum number of iterations to perform.
+    xtol : float
+        Relative error in solution `xopt` acceptable for convergence.
+
+    Notes
+    -----
+    Uses inverse parabolic interpolation when possible to speed up
+    convergence of golden section method.
+
+    """
+    tol = xtol
+    if tol < 0:
+        raise ValueError('tolerance should be >= 0, got %r' % tol)
+
+    brent = Brent(func=func, args=args, tol=tol,
+                  full_output=True, maxiter=maxiter)
+    brent.set_bracket(brack)
+    brent.optimize()
+    x, fval, nit, nfev = brent.get_result(full_output=True)
+
+    success = nit < maxiter and not (np.isnan(x) or np.isnan(fval))
+
+    return OptimizeResult(fun=fval, x=x, nit=nit, nfev=nfev,
+                          success=success)
+
 
 def _linesearch_powell(func, p, xi, tol=1e-3,
                        lower_bound=None, upper_bound=None, fval=None):
